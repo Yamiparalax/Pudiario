@@ -8,6 +8,7 @@ import getpass
 import logging
 import smtplib
 from email.message import EmailMessage
+
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -20,12 +21,11 @@ INICIO_EXEC_SP = datetime.now(TZ)
 DATA_EXEC = INICIO_EXEC_SP.date().isoformat()
 HORA_EXEC = INICIO_EXEC_SP.strftime("%H:%M:%S")
 NAVEGADOR_ESCONDIDO = False
-MODO_SUBIDA_BQ = "append"
 REGRAVAREXCEL = False
 RETCODE_SUCESSO = 0
 RETCODE_FALHA = 1
 RETCODE_SEMDADOSPARAPROCESSAR = 2
-BQ_TABELA_DESTINO = "projeto.dataset.tabela"
+BQ_TABELA_DESTINO = "project.dataset.table"
 BQ_TABELA_METRICAS = "datalab-pagamentos.ADMINISTRACAO_CELULA_PYTHON.automacoes_exec"
 EMAILS_PRINCIPAL = "carlos.lsilva@c6bank.com; sofia.fernandes@c6bank.com"
 EMAILS_CC = ""
@@ -44,11 +44,14 @@ class Execucao:
         return len(sys.argv) > 1 or "SERVIDOR_ORIGEM" in os.environ or "MODO_EXECUCAO" in os.environ
 
     def abrir_gui(self):
-        from PySide6.QtWidgets import QApplication, QWidget
-        app = QApplication([])
-        widget = QWidget()
-        widget.setWindowTitle(NOME_SCRIPT)
-        widget.show()
+        from PySide6.QtWidgets import QApplication, QLabel
+        from PySide6.QtCore import Qt, QTimer
+        app = QApplication.instance() or QApplication([])
+        label = QLabel(f"{NOME_SCRIPT} - EXECUCAO LOCAL")
+        label.setAlignment(Qt.AlignCenter)
+        label.resize(420, 120)
+        label.show()
+        QTimer.singleShot(1500, app.quit)
         app.exec()
 
     def detectar(self):
@@ -135,8 +138,8 @@ def carregar_staging(client, logger, df, staging_id):
         if not primeira:
             job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
         job = client.load_table_from_dataframe(bloco, staging_id, job_config=job_config)
-        resultado = job.result()
-        logger.info(f"Staging carregada job_id={resultado.job_id} linhas={bloco.shape[0]}")
+        job.result()
+        logger.info(f"Staging carregada job_id={job.job_id} linhas={bloco.shape[0]}")
         primeira = False
 
 def merge_dedup(client, logger, staging_id, destino_id, colunas):
@@ -150,9 +153,9 @@ def merge_dedup(client, logger, staging_id, destino_id, colunas):
     """
     logger.info(f"Executando merge deduplicado: {query}")
     job = client.query(query)
-    resultado = job.result()
+    job.result()
     linhas_inseridas = job.num_dml_affected_rows or 0
-    logger.info(f"Merge concluído job_id={resultado.job_id} linhas_inseridas={linhas_inseridas}")
+    logger.info(f"Merge concluído job_id={job.job_id} linhas_inseridas={linhas_inseridas}")
     return linhas_inseridas
 
 def remover_tabela(client, logger, tabela_id):
@@ -164,7 +167,6 @@ def remover_tabela(client, logger, tabela_id):
 
 
 def registrar_metricas_execucao(client, logger, execucao, status, tempo_exec):
-    tabela = client.get_table(BQ_TABELA_METRICAS)
     linhas = [
         {
             "nome_automacao": NOME_AUTOMACAO,
@@ -181,7 +183,7 @@ def registrar_metricas_execucao(client, logger, execucao, status, tempo_exec):
             "tabela_referencia": None,
         }
     ]
-    erros = client.insert_rows_json(tabela, linhas)
+    erros = client.insert_rows_json(BQ_TABELA_METRICAS, linhas)
     if erros:
         logger.error(f"Erros ao registrar métricas: {erros}")
     else:
@@ -192,7 +194,7 @@ def montar_email(status, hora_fim, linhas_processadas, linhas_inseridas, motivo_
     linhas_ignoradas = linhas_processadas - linhas_inseridas
     texto_sem_dados = ""
     if status == "SEM DADOS PARA PROCESSAR":
-        texto_sem_dados = motivo_sem_dados
+        texto_sem_dados = motivo_sem_dados.upper()
     corpo = f"""
     <html><body style='font-family: Montserrat, sans-serif; text-transform: uppercase;'>
     <p>AUTOMACAO: {NOME_AUTOMACAO}</p>
@@ -227,7 +229,11 @@ def calcular_tempo_execucao(hora_fim):
     fim = datetime.strptime(hora_fim, "%H:%M:%S")
     inicio = datetime.strptime(HORA_EXEC, "%H:%M:%S")
     delta = (fim - inicio) if fim >= inicio else (fim + timedelta(days=1) - inicio)
-    return str(delta)
+    total_segundos = int(delta.total_seconds())
+    horas = total_segundos // 3600
+    minutos = (total_segundos % 3600) // 60
+    segundos = total_segundos % 60
+    return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
 
 
 def processar_arquivo(client, logger, caminho):
@@ -240,13 +246,15 @@ def processar_arquivo(client, logger, caminho):
         return None
     staging_id = f"{BQ_TABELA_DESTINO}_staging_{NOME_SCRIPT}".replace("`", "")
     remover_tabela(client, logger, staging_id)
-    carregar_staging(client, logger, df, staging_id)
-    linhas_processadas = len(df)
-    colunas = df.columns.tolist()
-    linhas_inseridas = merge_dedup(client, logger, staging_id, BQ_TABELA_DESTINO, colunas)
-    remover_tabela(client, logger, staging_id)
-    logger.info(f"Processamento concluído para {caminho.name} processadas={linhas_processadas} inseridas={linhas_inseridas}")
-    return linhas_processadas, linhas_inseridas
+    try:
+        carregar_staging(client, logger, df, staging_id)
+        linhas_processadas = len(df)
+        colunas = df.columns.tolist()
+        linhas_inseridas = merge_dedup(client, logger, staging_id, BQ_TABELA_DESTINO, colunas)
+        logger.info(f"Processamento concluído para {caminho.name} processadas={linhas_processadas} inseridas={linhas_inseridas}")
+        return linhas_processadas, linhas_inseridas
+    finally:
+        remover_tabela(client, logger, staging_id)
 
 
 def main():
@@ -280,8 +288,6 @@ def main():
                 retcode = RETCODE_SEMDADOSPARAPROCESSAR
                 status_email = "SEM DADOS PARA PROCESSAR"
                 motivo_sem_dados = f" SEM DADOS PARA PROCESSAR, POIS HAVIA ARQUIVOS EM {PASTA_INPUT} MAS NENHUM COM O DATAFRAME ESPERADO"
-            else:
-                client = client
     except Exception as exc:
         logger.exception(f"Erro na execução: {exc}")
         retcode = RETCODE_FALHA
