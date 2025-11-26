@@ -44,15 +44,32 @@ class Execucao:
         return len(sys.argv) > 1 or "SERVIDOR_ORIGEM" in os.environ or "MODO_EXECUCAO" in os.environ
 
     def abrir_gui(self):
-        from PySide6.QtWidgets import QApplication, QLabel
-        from PySide6.QtCore import Qt, QTimer
+        from PySide6.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QPushButton
+        from PySide6.QtCore import Qt
         app = QApplication.instance() or QApplication([])
-        label = QLabel(f"{NOME_SCRIPT} - EXECUCAO LOCAL")
+        escolha = {"modo": None}
+
+        def selecionar(modo):
+            escolha["modo"] = modo
+            app.quit()
+
+        janela = QWidget()
+        janela.setWindowTitle(f"{NOME_SCRIPT} - EXECUCAO LOCAL")
+        layout = QVBoxLayout()
+        label = QLabel("Selecione o modo de execução")
         label.setAlignment(Qt.AlignCenter)
-        label.resize(420, 120)
-        label.show()
-        QTimer.singleShot(1500, app.quit)
+        layout.addWidget(label)
+        botao_auto = QPushButton("AUTO")
+        botao_solicitacao = QPushButton("SOLICITACAO")
+        botao_auto.clicked.connect(lambda: selecionar("AUTO"))
+        botao_solicitacao.clicked.connect(lambda: selecionar("SOLICITACAO"))
+        layout.addWidget(botao_auto)
+        layout.addWidget(botao_solicitacao)
+        janela.setLayout(layout)
+        janela.resize(420, 180)
+        janela.show()
         app.exec()
+        return escolha["modo"]
 
     def detectar(self):
         if self.is_servidor():
@@ -60,8 +77,8 @@ class Execucao:
             self.usuario = getpass.getuser()
             return self
         try:
-            self.abrir_gui()
-            self.modo = "SOLICITACAO"
+            modo_escolhido = self.abrir_gui()
+            self.modo = modo_escolhido if modo_escolhido else "AUTO"
             self.usuario = getpass.getuser()
         except Exception:
             self.modo = "AUTO"
@@ -183,11 +200,14 @@ def registrar_metricas_execucao(client, logger, execucao, status, tempo_exec):
             "tabela_referencia": None,
         }
     ]
-    erros = client.insert_rows_json(BQ_TABELA_METRICAS, linhas)
-    if erros:
-        logger.error(f"Erros ao registrar métricas: {erros}")
-    else:
-        logger.info("Métricas registradas")
+    try:
+        erros = client.insert_rows_json(table=BQ_TABELA_METRICAS, json_rows=linhas)
+        if erros:
+            logger.error(f"Erros ao registrar métricas: {erros}")
+        else:
+            logger.info("Métricas registradas")
+    except Exception as exc:
+        logger.exception(f"Falha ao registrar métricas: {exc}")
 
 
 def montar_email(status, hora_fim, linhas_processadas, linhas_inseridas, motivo_sem_dados):
