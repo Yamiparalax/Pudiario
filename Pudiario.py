@@ -102,45 +102,76 @@ def configurar_logger():
     stream_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
+    logger.info(f"Logger configurado arquivo={log_path} pasta_input={PASTA_INPUT} pasta_logs={PASTA_LOGS}")
     return logger, log_path
 
-def localizar_credenciais():
+def localizar_credenciais(logger):
     cred_env = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if cred_env and Path(cred_env).exists():
-        return Path(cred_env)
+    if cred_env:
+        caminho_env = Path(cred_env)
+        logger.info(f"Variável GOOGLE_APPLICATION_CREDENTIALS definida em {caminho_env}")
+        if caminho_env.exists():
+            logger.info("Credenciais localizadas via variável de ambiente")
+            return caminho_env
+        logger.error("Caminho definido em GOOGLE_APPLICATION_CREDENTIALS não encontrado")
+    logger.info("Buscando credenciais .json na home do usuário")
     possiveis = list(Path.home().rglob("*.json"))
     for caminho in possiveis:
         if "credential" in caminho.name.lower() or "service" in caminho.name.lower():
+            logger.info(f"Credenciais encontradas em {caminho}")
             return caminho
+    logger.error("Nenhuma credencial .json encontrada na busca padrão")
     return None
 
 def criar_cliente_bq(logger):
-    cred_path = localizar_credenciais()
+    logger.info("Iniciando criação do cliente BigQuery")
+    cred_path = localizar_credenciais(logger)
     if cred_path is None:
+        logger.error("Credenciais BigQuery não encontradas")
         raise FileNotFoundError("Credenciais BigQuery não encontradas")
-    credentials = service_account.Credentials.from_service_account_file(str(cred_path))
-    project_id = credentials.project_id
-    logger.info(f"Cliente BigQuery usando projeto {project_id}")
-    return bigquery.Client(credentials=credentials, project=project_id)
+    try:
+        credentials = service_account.Credentials.from_service_account_file(str(cred_path))
+        project_id = credentials.project_id
+        logger.info(f"Cliente BigQuery usando projeto {project_id}")
+        return bigquery.Client(credentials=credentials, project=project_id)
+    except Exception as exc:
+        logger.exception(f"Erro ao criar cliente BigQuery com credenciais em {cred_path}: {exc}")
+        raise
 
-def mover_arquivo(origem, destino_dir):
+def mover_arquivo(logger, origem, destino_dir):
     destino_dir.mkdir(parents=True, exist_ok=True)
     destino = destino_dir / origem.name
     if destino.exists():
         timestamp = datetime.now(TZ).strftime("%H%M%S")
         destino = destino_dir / f"{origem.stem}_{timestamp}{origem.suffix}"
     shutil.move(str(origem), str(destino))
+    logger.info(f"Arquivo movido de {origem} para {destino}")
     return destino
 
-def carregar_dataframe(caminho):
-    if caminho.suffix.lower() in [".xlsx", ".xlsm", ".xls"]:
-        return pd.read_excel(caminho, dtype=DTYPES_CSV)
-    if caminho.suffix.lower() == ".csv":
-        return pd.read_csv(caminho, dtype=DTYPES_CSV)
-    return None
+def carregar_dataframe(logger, caminho):
+    try:
+        if caminho.suffix.lower() in [".xlsx", ".xlsm", ".xls"]:
+            logger.info(f"Carregando arquivo Excel {caminho.name}")
+            df = pd.read_excel(caminho, dtype=DTYPES_CSV)
+            logger.info(f"Arquivo {caminho.name} carregado com {len(df)} linhas")
+            return df
+        if caminho.suffix.lower() == ".csv":
+            logger.info(f"Carregando arquivo CSV {caminho.name}")
+            df = pd.read_csv(caminho, dtype=DTYPES_CSV)
+            logger.info(f"Arquivo {caminho.name} carregado com {len(df)} linhas")
+            return df
+        logger.info(f"Formato não suportado para {caminho.name}")
+        return None
+    except Exception as exc:
+        logger.exception(f"Erro ao carregar arquivo {caminho.name}: {exc}")
+        raise
 
-def validar_colunas(df):
-    return list(df.columns) == COLUNAS_ESPERADAS
+def validar_colunas(logger, df):
+    colunas_encontradas = list(df.columns)
+    valido = colunas_encontradas == COLUNAS_ESPERADAS
+    if not valido:
+        logger.error(f"Schema inválido. Esperado={COLUNAS_ESPERADAS} Encontrado={colunas_encontradas}")
+    return valido
 
 def fracionar_dataframe(df, tamanho):
     inicio = 0
@@ -156,7 +187,7 @@ def carregar_staging(client, logger, df, staging_id):
             job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
         job = client.load_table_from_dataframe(bloco, staging_id, job_config=job_config)
         job.result()
-        logger.info(f"Staging carregada job_id={job.job_id} linhas={bloco.shape[0]}")
+        logger.info(f"Staging carregada job_id={job.job_id} linhas={bloco.shape[0]} destino={staging_id}")
         primeira = False
 
 def merge_dedup(client, logger, staging_id, destino_id, colunas):
@@ -168,7 +199,8 @@ def merge_dedup(client, logger, staging_id, destino_id, colunas):
     ON {on_clause}
     WHEN NOT MATCHED THEN INSERT ({', '.join(colunas)}) VALUES ({', '.join([f'S.{c}' for c in colunas])})
     """
-    logger.info(f"Executando merge deduplicado: {query}")
+    logger.info(f"Executando merge deduplicado staging={staging_id} destino={destino_id}")
+    logger.info(f"Consulta MERGE: {query}")
     job = client.query(query)
     job.result()
     linhas_inseridas = job.num_dml_affected_rows or 0
@@ -180,7 +212,7 @@ def remover_tabela(client, logger, tabela_id):
         client.delete_table(tabela_id, not_found_ok=True)
         logger.info(f"Tabela removida {tabela_id}")
     except Exception as exc:
-        logger.error(f"Erro ao remover staging {tabela_id}: {exc}")
+        logger.exception(f"Erro ao remover staging {tabela_id}: {exc}")
 
 
 def registrar_metricas_execucao(client, logger, execucao, status, tempo_exec):
@@ -201,6 +233,7 @@ def registrar_metricas_execucao(client, logger, execucao, status, tempo_exec):
         }
     ]
     try:
+        logger.info(f"Registrando métricas execucao={status} tempo={tempo_exec} modo={execucao.modo}")
         erros = client.insert_rows_json(table=BQ_TABELA_METRICAS, json_rows=linhas)
         if erros:
             logger.error(f"Erros ao registrar métricas: {erros}")
@@ -242,7 +275,7 @@ def enviar_email(logger, assunto, corpo, log_path, sucesso, cc):
             smtp.send_message(mensagem)
         logger.info("Email enviado")
     except Exception as exc:
-        logger.error(f"Falha ao enviar email: {exc}")
+        logger.exception(f"Falha ao enviar email: {exc}")
 
 
 def calcular_tempo_execucao(hora_fim):
@@ -257,11 +290,12 @@ def calcular_tempo_execucao(hora_fim):
 
 
 def processar_arquivo(client, logger, caminho):
-    df = carregar_dataframe(caminho)
+    logger.info(f"Iniciando processamento do arquivo {caminho.name}")
+    df = carregar_dataframe(logger, caminho)
     if df is None:
         logger.info(f"Arquivo ignorado por formato: {caminho.name}")
         return None
-    if not validar_colunas(df):
+    if not validar_colunas(logger, df):
         logger.info(f"Arquivo ignorado por schema: {caminho.name}")
         return None
     staging_id = f"{BQ_TABELA_DESTINO}_staging_{NOME_SCRIPT}".replace("`", "")
@@ -273,6 +307,9 @@ def processar_arquivo(client, logger, caminho):
         linhas_inseridas = merge_dedup(client, logger, staging_id, BQ_TABELA_DESTINO, colunas)
         logger.info(f"Processamento concluído para {caminho.name} processadas={linhas_processadas} inseridas={linhas_inseridas}")
         return linhas_processadas, linhas_inseridas
+    except Exception as exc:
+        logger.exception(f"Erro ao processar {caminho.name}: {exc}")
+        raise
     finally:
         remover_tabela(client, logger, staging_id)
 
@@ -280,7 +317,7 @@ def processar_arquivo(client, logger, caminho):
 def main():
     execucao = Execucao().detectar()
     logger, log_path = configurar_logger()
-    logger.info(f"Iniciando script {NOME_SCRIPT} modo={execucao.modo}")
+    logger.info(f"Iniciando script {NOME_SCRIPT} modo={execucao.modo} usuario={execucao.usuario}")
     retcode = RETCODE_SUCESSO
     status_email = "SUCESSO"
     linhas_processadas_total = 0
@@ -288,10 +325,12 @@ def main():
     motivo_sem_dados = ""
     try:
         arquivos = sorted(PASTA_INPUT.iterdir()) if PASTA_INPUT.exists() else []
+        logger.info(f"Arquivos encontrados na pasta input: {len(arquivos)}")
         if not arquivos:
             retcode = RETCODE_SEMDADOSPARAPROCESSAR
             status_email = "SEM DADOS PARA PROCESSAR"
             motivo_sem_dados = f" SEM DADOS PARA PROCESSAR, POIS NAO HAVIA ARQUIVOS NA PASTA {PASTA_INPUT}"
+            logger.info(motivo_sem_dados.strip())
         else:
             client = criar_cliente_bq(logger)
             arquivos_validos = []
@@ -302,30 +341,35 @@ def main():
                         linhas_proc, linhas_ins = resultado
                         linhas_processadas_total += linhas_proc
                         linhas_inseridas_total += linhas_ins
-                        mover_arquivo(arquivo, PASTA_LOGS)
+                        mover_arquivo(logger, arquivo, PASTA_LOGS)
                         arquivos_validos.append(arquivo)
+                    else:
+                        logger.info(f"Arquivo ignorado sem processamento: {arquivo.name}")
+            logger.info(f"Arquivos válidos processados: {len(arquivos_validos)} de {len(arquivos)}")
             if not arquivos_validos:
                 retcode = RETCODE_SEMDADOSPARAPROCESSAR
                 status_email = "SEM DADOS PARA PROCESSAR"
                 motivo_sem_dados = f" SEM DADOS PARA PROCESSAR, POIS HAVIA ARQUIVOS EM {PASTA_INPUT} MAS NENHUM COM O DATAFRAME ESPERADO"
+                logger.info(motivo_sem_dados.strip())
     except Exception as exc:
         logger.exception(f"Erro na execução: {exc}")
         retcode = RETCODE_FALHA
         status_email = "FALHA"
     hora_fim = datetime.now(TZ).strftime("%H:%M:%S")
     tempo_exec = calcular_tempo_execucao(hora_fim)
+    logger.info(f"Resumo da execução status={status_email} linhas_processadas={linhas_processadas_total} linhas_inseridas={linhas_inseridas_total} tempo_execucao={tempo_exec}")
     try:
         client_metricas = criar_cliente_bq(logger)
         registrar_metricas_execucao(client_metricas, logger, execucao, status_email, tempo_exec)
     except Exception as exc:
-        logger.error(f"Falha ao registrar métricas: {exc}")
+        logger.exception(f"Falha ao registrar métricas: {exc}")
     try:
         sucesso = status_email == "SUCESSO"
         assunto = f"CÉLULA PYTHON MONITORAÇÃO - {NOME_SCRIPT} - {status_email}"
         corpo = montar_email(status_email, hora_fim, linhas_processadas_total, linhas_inseridas_total, motivo_sem_dados)
         enviar_email(logger, assunto, corpo, log_path, sucesso, EMAILS_CC)
     except Exception as exc:
-        logger.error(f"Falha ao enviar email: {exc}")
+        logger.exception(f"Falha ao enviar email: {exc}")
     logger.info(f"Fim da execução status={status_email} retcode={retcode}")
     return retcode
 
