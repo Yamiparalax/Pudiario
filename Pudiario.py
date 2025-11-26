@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import getpass
+import json
 import logging
 import smtplib
 from email.message import EmailMessage
@@ -105,19 +106,31 @@ def configurar_logger():
     logger.info(f"Logger configurado arquivo={log_path} pasta_input={PASTA_INPUT} pasta_logs={PASTA_LOGS}")
     return logger, log_path
 
+def credencial_valida(logger, caminho):
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        if isinstance(dados, dict) and dados.get("type") == "service_account" and dados.get("project_id"):
+            return True
+        logger.info(f"Arquivo de credencial ignorado por formato inválido: {caminho}")
+        return False
+    except Exception as exc:
+        logger.info(f"Falha ao ler credencial candidata {caminho}: {exc}")
+        return False
+
 def localizar_credenciais(logger):
     cred_env = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if cred_env:
         caminho_env = Path(cred_env)
         logger.info(f"Variável GOOGLE_APPLICATION_CREDENTIALS definida em {caminho_env}")
-        if caminho_env.exists():
+        if caminho_env.exists() and credencial_valida(logger, caminho_env):
             logger.info("Credenciais localizadas via variável de ambiente")
             return caminho_env
-        logger.error("Caminho definido em GOOGLE_APPLICATION_CREDENTIALS não encontrado")
+        logger.error("Caminho definido em GOOGLE_APPLICATION_CREDENTIALS não encontrado ou inválido")
     logger.info("Buscando credenciais .json na home do usuário")
-    possiveis = list(Path.home().rglob("*.json"))
+    possiveis = sorted(Path.home().rglob("*.json"))
     for caminho in possiveis:
-        if "credential" in caminho.name.lower() or "service" in caminho.name.lower():
+        if ("credential" in caminho.name.lower() or "service" in caminho.name.lower()) and credencial_valida(logger, caminho):
             logger.info(f"Credenciais encontradas em {caminho}")
             return caminho
     logger.error("Nenhuma credencial .json encontrada na busca padrão")
