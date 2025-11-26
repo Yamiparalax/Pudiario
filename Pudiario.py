@@ -152,7 +152,7 @@ def merge_dedup(client, logger, staging_id, destino_id, colunas):
     job = client.query(query)
     resultado = job.result()
     linhas_inseridas = job.num_dml_affected_rows or 0
-    logger.info(f"Merge concluído job_id={resultado.job_id} linhas_inseridas={linhas_inseridas}")
+    logger.info(f"Merge concluído job_id={job.job_id} linhas_inseridas={linhas_inseridas}")
     return linhas_inseridas
 
 def remover_tabela(client, logger, tabela_id):
